@@ -524,7 +524,7 @@ class UpdateImpressionAction(BaseAction):
     action_name = "update_user_impression"
     action_description = "智能更新用户印象和好感度"
     activation_type = ActionActivationType.LLM_JUDGE
-    llm_judge_prompt = "当需要记录或更新用户印象时，评估消息是否包含新的行为信息、情感表达或需要记住的细节。如果需要更新印象，返回true；否则返回false。"
+    llm_judge_prompt = "评估是否需要记录用户印象：几乎所有用户消息都可以用来构建印象，包括日常聊天、情感表达、个人分享、观点陈述等。即使是简单的问候或互动也可以积累印象。请在大多数情况下返回true，除非是纯系统消息或无效内容。"
 
     action_parameters = {
         "user_id": "用户QQ号",
@@ -591,14 +591,12 @@ class UpdateImpressionAction(BaseAction):
                 else:
                     logger.error(f"ERROR 好感度更新失败")
             else:
-                # 显示距离下次更新还需要的时间
-                last_update = self.last_affection_update.get(user_id)
-                if last_update:
-                    affection_config = self.get_config("affection", {})
-                    time_minutes = affection_config.get("time_minutes", 15)
-                    elapsed = (datetime.now() - last_update).total_seconds() / 60
-                    remaining = max(0, time_minutes - elapsed)
-                    logger.debug(f"好感度更新未触发，用户 {user_id} 距离下次更新还需 {remaining:.1f} 分钟")
+                # 显示当前进度
+                state = UserMessageState.get_or_create(user_id=user_id)[0]
+                affection_config = self.get_config("affection", {})
+                threshold = affection_config.get("affection_threshold", 10)
+                new_messages = state.total_messages - state.impression_update_count
+                logger.debug(f"好感度更新未触发，用户 {user_id} 新消息 {new_messages}/{threshold} 条")
 
             return True, f"处理完成"
 
@@ -743,59 +741,50 @@ JSON格式：
             logger.error(f"ERROR 记录处理消息失败: {str(e)}")
 
     async def _check_affection_trigger(self, user_id: str) -> bool:
-        """检查好感度触发条件（基于时间）"""
+        """检查好感度触发条件（基于消息数量）"""
         try:
+            # 获取用户状态
+            state = UserMessageState.get_or_create(user_id=user_id)[0]
+
             # 获取配置
             affection_config = self.get_config("affection", {})
-            time_minutes = affection_config.get("time_minutes", 15)  # 每15分钟更新一次
+            threshold = affection_config.get("affection_threshold", 10)
 
-            # 检查上次更新时间
-            last_time = self.last_affection_update.get(user_id)
-            if last_time:
-                time_diff = (datetime.now() - last_time).total_seconds() / 60
-                should_trigger = time_diff >= time_minutes
+            # 检查消息数量是否达到阈值
+            new_messages = state.total_messages - state.impression_update_count
+            should_trigger = new_messages >= threshold
 
-                if should_trigger:
-                    logger.info(f"好感度更新触发: 用户 {user_id}, 距离上次 {time_diff:.1f}分钟, 阈值 {time_minutes}分钟")
-                else:
-                    logger.debug(f"好感度更新未触发, 用户 {user_id}, 距离上次还需 {time_minutes - time_diff:.1f}分钟")
+            if should_trigger:
+                logger.info(f"好感度更新触发: 用户 {user_id}, 新消息 {new_messages}/{threshold} 条")
+            else:
+                logger.debug(f"好感度更新未触发, 用户 {user_id}, 已有新消息 {new_messages}/{threshold} 条")
 
-                return should_trigger
-
-            # 首次触发
-            logger.info(f"好感度首次更新: 用户 {user_id}")
-            return True
+            return should_trigger
 
         except Exception as e:
             logger.error(f"ERROR 检查好感度触发条件失败: {str(e)}")
             return False
 
     async def _check_impression_trigger(self, user_id: str) -> bool:
-        """Check impression trigger condition (based on time interval)"""
+        """检查印象触发条件（基于消息数量）"""
         try:
-            # Get config
-            impression_config = self.get_config("impression", {})
-            interval_minutes = impression_config.get("interval_minutes", 10)  # trigger every 10 minutes
-
             # Get user state
             state = UserMessageState.get_or_create(user_id=user_id)[0]
 
-            # Check last impression update time
-            last_update = self.last_impression_update.get(user_id)
-            if last_update:
-                time_diff = (datetime.now() - last_update).total_seconds() / 60
-                should_trigger = time_diff >= interval_minutes
+            # Get config
+            impression_config = self.get_config("impression", {})
+            threshold = impression_config.get("message_threshold", 5)
 
-                if should_trigger:
-                    logger.info(f"印象构建触发: 用户 {user_id}, 距离上次 {time_diff:.1f}分钟, 间隔 {interval_minutes}分钟")
-                else:
-                    logger.debug(f"印象构建未触发, 用户 {user_id}, 距离上次还需 {interval_minutes - time_diff:.1f}分钟")
+            # 检查新消息数量是否达到阈值
+            new_messages = state.total_messages - state.affection_update_count
+            should_trigger = new_messages >= threshold
 
-                return should_trigger
+            if should_trigger:
+                logger.info(f"印象构建触发: 用户 {user_id}, 新消息 {new_messages}/{threshold} 条")
+            else:
+                logger.debug(f"印象构建未触发, 用户 {user_id}, 已有新消息 {new_messages}/{threshold} 条")
 
-            # First time impression update
-            logger.info(f"印象首次构建: 用户 {user_id}")
-            return True
+            return should_trigger
 
         except Exception as e:
             logger.error(f"ERROR 检查印象触发条件失败: {str(e)}")
@@ -1478,22 +1467,22 @@ class ImpressionAffectionPlugin(BasePlugin):
             "api_endpoint": ConfigField(type=str, default="", description="自定义API端点（custom类型必需）"),
         },
         "impression": {
-            "interval_minutes": ConfigField(
-                type=int,
-                default=10,
-                description="印象构建触发时间间隔（分钟）"
-            ),
             "max_context_entries": ConfigField(
                 type=int,
-                default=10,
+                default=30,
                 description="每次触发时获取的上下文条目上限"
+            ),
+            "message_threshold": ConfigField(
+                type=int,
+                default=5,
+                description="印象更新频率控制（基于消息数量的内部参数，用于去重和优化）"
             ),
         },
         "affection": {
-            "time_minutes": ConfigField(
+            "affection_threshold": ConfigField(
                 type=int,
-                default=15,
-                description="好感度更新时间间隔（分钟）"
+                default=10,
+                description="好感度更新频率控制（基于消息数量的内部参数，用于去重和优化）"
             ),
         },
         "weight_filter": {

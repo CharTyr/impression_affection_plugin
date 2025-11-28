@@ -1,12 +1,17 @@
 # 印象和好感度系统插件
 
-为机器人添加动态印象和好感度记忆系统。
+为机器人添加动态印象和好感度记忆系统，支持AI生成自然语言印象、智能向量检索和增量消息处理。
 
 ## 核心功能
 
 ### 智能触发机制
-- **印象构建**: 基于时间间隔触发（每X分钟），避免频繁调用LLM节省token
-- **好感度更新**: 基于时间触发，确保不会错过情感变化
+- **印象构建**: 基于LLM判定触发 + 消息数量控制，高频率捕获用户特征变化
+- **好感度更新**: 基于LLM判定触发 + 消息数量控制，及时响应情感变化
+
+### LLM驱动判定
+- 使用LLM智能判定消息是否值得记录
+- 宽松触发策略，几乎所有用户消息都会被处理
+- 避免错过任何有价值的印象细节
 
 ### 权重筛选系统
 - 使用LLM评估每条消息的价值和权重
@@ -50,14 +55,14 @@ friendly_increment = 2.0    # 友善评论增幅
 neutral_increment = 0.5     # 中性评论增幅
 negative_increment = -3.0   # 差劲评论减幅
 
-# 印象构建触发条件
+# 印象构建配置
 [impression]
-interval_minutes = 10        # 每10分钟触发一次印象构建
-max_context_entries = 10     # 每次最多处理10条消息
+max_context_entries = 30     # 每次最多处理30条上下文消息
+message_threshold = 5        # 每5条新消息触发一次印象构建
 
-# 好感度更新触发条件
+# 好感度更新配置
 [affection]
-time_minutes = 15            # 每15分钟触发好感度更新
+affection_threshold = 10     # 每10条新消息触发一次好感度更新
 
 # 权重筛选配置
 [weight_filter]
@@ -183,33 +188,46 @@ CREATE TABLE impression_message_records (
 ```
 收到消息
   -> 更新UserMessageState
-  -> 检查印象构建触发（消息数量）
-  -> 检查好感度更新触发（时间间隔）
+  -> LLM判定是否需要记录印象
+  -> 检查印象构建触发（新消息数量）
+  -> 检查好感度更新触发（新消息数量）
   -> 调用相应更新逻辑
 ```
 
-### 印象构建触发
+### LLM判定机制
+LLM使用宽松策略判定消息价值，几乎所有用户消息都会被认为值得记录：
 ```python
-if total_messages >= message_threshold:
-    await build_impression()
+llm_judge_prompt = "评估是否需要记录用户印象：几乎所有用户消息都可以用来构建印象，包括日常聊天、情感表达、个人分享、观点陈述等。即使是简单的问候或互动也可以积累印象。请在大多数情况下返回true，除非是纯系统消息或无效内容。"
 ```
 
-### 好感度更新触发
+### 印象构建触发（基于消息数量）
 ```python
-if (now - last_affection_time).minutes >= time_minutes:
+new_messages = total_messages - affection_update_count
+if new_messages >= message_threshold:
+    await build_impression()
+    impression_update_count += new_messages
+```
+
+### 好感度更新触发（基于消息数量）
+```python
+new_messages = total_messages - impression_update_count
+if new_messages >= affection_threshold:
     await update_affection()
+    affection_update_count += new_messages
 ```
 
 ## 配置详解
 
 ### 触发条件配置
 ```toml
-[triggers.impression]
-message_threshold = 10  # 印象构建阈值（条消息）
+[impression]
+message_threshold = 5  # 印象构建阈值（新消息数量）
 
-[triggers.affection]
-time_minutes = 5  # 好感度更新间隔（分钟）
+[affection]
+affection_threshold = 10  # 好感度更新阈值（新消息数量）
 ```
+
+**注意**: 实际的触发由LLM判定决定，只有当LLM认为消息值得记录且新消息数量达到阈值时才会真正执行。
 
 ### 模型提供商配置
 ```toml
@@ -334,14 +352,23 @@ JSON格式：
 
 ## 优化亮点
 
-1. **时间触发机制** - 印象构建按时间间隔触发，避免频繁LLM调用
-2. **避免错过** - 好感度更新基于时间触发，及时捕捉情感变化
+1. **LLM驱动触发** - 使用LLM智能判定消息价值，宽松策略避免遗漏
+2. **高频更新** - 基于消息数量的快速响应，捕捉用户特征变化
 3. **权重筛选** - 智能过滤低价值消息，提高印象准确性和效率
 4. **自动去重** - 避免重复处理相同消息，节省token
 5. **上下文限制** - 每次触发限制条目数量，进一步控制token消耗
 6. **增量处理** - 只处理未获取的消息，提高效率
 7. **独立配置** - 不依赖主程序模型，完全独立
 8. **可定制化** - 支持自定义提示词模板和权重评估标准
+
+## 最新版本特性 (v1.0.0)
+
+### 2025-11-29 更新
+- **全新触发机制**: 改为LLM判定 + 消息数量控制，告别虚假的时间间隔配置
+- **大幅提升触发频率**: LLM使用宽松策略，几乎所有用户消息都会被处理
+- **基于消息数量**: 印象每5条消息触发，好感度每10条消息触发
+- **智能判定**: "几乎所有用户消息都可以用来构建印象"
+- **文档优化**: 更新README，移除所有误导性的定时任务说明
 
 ## 故障排除
 
