@@ -9,7 +9,7 @@
   },
   "license": "MIT",
   "host_application": {
-    "min_version": "0.11.5"
+    "min_version": "0.11.0"
   },
   "repository_url": "https://github.com/heitiehu-beep/impression_affection_plugin",
   "keywords": ["记忆系统", "人工智能", "好感度", "印象", "向量检索"],
