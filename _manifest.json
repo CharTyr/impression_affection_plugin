@@ -1,0 +1,17 @@
+{
+  "manifest_version": 1,
+  "name": "印象和好感度系统",
+  "version": "1.0.0",
+  "description": "为机器人添加动态印象和好感度记忆系统，支持AI生成自然语言印象、智能向量检索和增量消息处理",
+  "author": {
+    "name": "heitiehu-beep",
+    "url": "https://github.com/heitiehu-beep"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.11.0"
+  },
+  "repository_url": "https://github.com/YOUR_USERNAME/impression_affection_plugin",
+  "keywords": ["memory", "ai", "affection", "impression", "vector"],
+  "categories": ["Entertainment & Interaction"]
+}
