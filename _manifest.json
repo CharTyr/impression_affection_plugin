@@ -9,9 +9,9 @@
   },
   "license": "MIT",
   "host_application": {
-    "min_version": "0.11.0"
+    "min_version": "0.11.5"
   },
-  "repository_url": "https://github.com/YOUR_USERNAME/impression_affection_plugin",
-  "keywords": ["memory", "ai", "affection", "impression", "vector"],
+  "repository_url": "https://github.com/heitiehu-beep/impression_affection_plugin",
+  "keywords": ["记忆系统", "人工智能", "好感度", "印象", "向量检索"],
   "categories": ["Entertainment & Interaction"]
 }
