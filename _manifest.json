@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "印象和好感度系统插件",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "为机器人添加动态印象和好感度记忆系统，支持AI生成自然语言印象、智能向量检索和增量消息处理",
   "author": {
     "name": "heitiehu-beep",

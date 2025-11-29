@@ -523,8 +523,7 @@ class UpdateImpressionAction(BaseAction):
 
     action_name = "update_user_impression"
     action_description = "智能更新用户印象和好感度"
-    activation_type = ActionActivationType.LLM_JUDGE
-    llm_judge_prompt = "评估是否需要记录用户印象：几乎所有用户消息都可以用来构建印象，包括日常聊天、情感表达、个人分享、观点陈述等。即使是简单的问候或互动也可以积累印象。请在大多数情况下返回true，除非是纯系统消息或无效内容。"
+    activation_type = ActionActivationType.ALWAYS
 
     action_parameters = {
         "user_id": "用户QQ号",
@@ -547,7 +546,7 @@ class UpdateImpressionAction(BaseAction):
         self.last_affection_update = {}  # user_id -> last affection update time
 
     async def execute(self) -> Tuple[bool, str]:
-        """Execute impression update"""
+        """Execute impression update - always run when called by planner"""
         try:
             user_id = self.action_data.get("user_id")
             message = self.action_data.get("message")
@@ -563,40 +562,23 @@ class UpdateImpressionAction(BaseAction):
             # Update message state
             await self._update_message_state(user_id, message_id, message, context)
 
-            # Check impression trigger condition (based on message count)
-            impression_trigger = await self._check_impression_trigger(user_id)
-            if impression_trigger:
-                logger.info(f"触发印象构建，用户: {user_id}，正在分析消息...")
-                success = await self._update_impression(user_id, message, context)
-                if success:
-                    self.last_impression_update[user_id] = datetime.now()
-                    logger.info(f"SUCCESS 印象构建完成")
-                else:
-                    logger.error(f"ERROR 印象构建失败")
+            # Always update impression - no frequency check needed
+            logger.info(f"执行印象构建，用户: {user_id}，正在分析消息...")
+            impression_success = await self._update_impression(user_id, message, context)
+            if impression_success:
+                self.last_impression_update[user_id] = datetime.now()
+                logger.info(f"SUCCESS 印象构建完成")
             else:
-                # 显示当前进度
-                state = UserMessageState.get_or_create(user_id=user_id)[0]
-                impression_config = self.get_config("triggers.impression", {})
-                threshold = impression_config.get("message_threshold", 10)
-                logger.debug(f"印象构建未触发，用户 {user_id} 已发送 {state.total_messages}/{threshold} 条消息")
+                logger.error(f"ERROR 印象构建失败")
 
-            # 检查好感度更新触发条件（基于时间）
-            affection_trigger = await self._check_affection_trigger(user_id)
-            if affection_trigger:
-                logger.info(f"触发好感度更新，用户: {user_id}，正在评估情感...")
-                success = await self._update_affection(user_id, message, context)
-                if success:
-                    self.last_affection_update[user_id] = datetime.now()
-                    logger.info(f"SUCCESS 好感度更新完成")
-                else:
-                    logger.error(f"ERROR 好感度更新失败")
+            # Always update affection - no frequency check needed
+            logger.info(f"执行好感度更新，用户: {user_id}，正在评估情感...")
+            affection_success = await self._update_affection(user_id, message, context)
+            if affection_success:
+                self.last_affection_update[user_id] = datetime.now()
+                logger.info(f"SUCCESS 好感度更新完成")
             else:
-                # 显示当前进度
-                state = UserMessageState.get_or_create(user_id=user_id)[0]
-                affection_config = self.get_config("affection", {})
-                threshold = affection_config.get("affection_threshold", 10)
-                new_messages = state.total_messages - state.impression_update_count
-                logger.debug(f"好感度更新未触发，用户 {user_id} 新消息 {new_messages}/{threshold} 条")
+                logger.error(f"ERROR 好感度更新失败")
 
             return True, f"处理完成"
 
@@ -660,14 +642,14 @@ class UpdateImpressionAction(BaseAction):
             prompt_template = weight_config.get("weight_evaluation_prompt", "").strip()
 
             if prompt_template:
+                # 直接使用模板，支持换行符
                 prompt = prompt_template.format(
                     message=msg_record.message_content,
                     context=msg_record.context
                 )
             else:
-                # 默认权重评估提示词
-                prompt = f"""
-你是一个消息权重评估助手。请根据消息内容的价值和信息量，为每条消息评估权重分数。
+                # 默认权重评估提示词（使用换行符）
+                prompt = r"""你是一个消息权重评估助手。请根据消息内容的价值和信息量，为每条消息评估权重分数。
 
 权重分级标准：
 - 高权重 (70-100): 包含重要个人信息、情感表达、独特观点、深度话题等
@@ -685,9 +667,11 @@ JSON格式：
     "reason": "评估原因"
 }}
 
-用户消息: {msg_record.message_content}
-上下文: {msg_record.context}
-                """
+用户消息: {message}
+上下文: {context}""".format(
+                    message=msg_record.message_content,
+                    context=msg_record.context
+                )
 
             # 调用LLM评估权重
             if not self.model_client:
@@ -739,56 +723,6 @@ JSON格式：
                 logger.debug(f"已记录 {created_count} 条处理过的消息")
         except Exception as e:
             logger.error(f"ERROR 记录处理消息失败: {str(e)}")
-
-    async def _check_affection_trigger(self, user_id: str) -> bool:
-        """检查好感度触发条件（基于消息数量）"""
-        try:
-            # 获取用户状态
-            state = UserMessageState.get_or_create(user_id=user_id)[0]
-
-            # 获取配置
-            affection_config = self.get_config("affection", {})
-            threshold = affection_config.get("affection_threshold", 10)
-
-            # 检查消息数量是否达到阈值
-            new_messages = state.total_messages - state.impression_update_count
-            should_trigger = new_messages >= threshold
-
-            if should_trigger:
-                logger.info(f"好感度更新触发: 用户 {user_id}, 新消息 {new_messages}/{threshold} 条")
-            else:
-                logger.debug(f"好感度更新未触发, 用户 {user_id}, 已有新消息 {new_messages}/{threshold} 条")
-
-            return should_trigger
-
-        except Exception as e:
-            logger.error(f"ERROR 检查好感度触发条件失败: {str(e)}")
-            return False
-
-    async def _check_impression_trigger(self, user_id: str) -> bool:
-        """检查印象触发条件（基于消息数量）"""
-        try:
-            # Get user state
-            state = UserMessageState.get_or_create(user_id=user_id)[0]
-
-            # Get config
-            impression_config = self.get_config("impression", {})
-            threshold = impression_config.get("message_threshold", 5)
-
-            # 检查新消息数量是否达到阈值
-            new_messages = state.total_messages - state.affection_update_count
-            should_trigger = new_messages >= threshold
-
-            if should_trigger:
-                logger.info(f"印象构建触发: 用户 {user_id}, 新消息 {new_messages}/{threshold} 条")
-            else:
-                logger.debug(f"印象构建未触发, 用户 {user_id}, 已有新消息 {new_messages}/{threshold} 条")
-
-            return should_trigger
-
-        except Exception as e:
-            logger.error(f"ERROR 检查印象触发条件失败: {str(e)}")
-            return False
 
     async def _update_impression(self, user_id: str, message: str, context: str) -> bool:
         """Update impression (build natural language description)"""
@@ -1434,7 +1368,7 @@ class ImpressionAffectionPlugin(BasePlugin):
 
     config_schema: dict = {
         "plugin": {
-            "config_version": ConfigField(type=str, default="1.1.1", description="配置文件版本"),
+            "config_version": ConfigField(type=str, default="1.2.0", description="配置文件版本"),
             "enabled": ConfigField(type=bool, default=False, description="是否启用插件"),
         },
         "llm_provider": {
@@ -1472,18 +1406,6 @@ class ImpressionAffectionPlugin(BasePlugin):
                 default=30,
                 description="每次触发时获取的上下文条目上限"
             ),
-            "message_threshold": ConfigField(
-                type=int,
-                default=5,
-                description="印象更新频率控制（基于消息数量的内部参数，用于去重和优化）"
-            ),
-        },
-        "affection": {
-            "affection_threshold": ConfigField(
-                type=int,
-                default=10,
-                description="好感度更新频率控制（基于消息数量的内部参数，用于去重和优化）"
-            ),
         },
         "weight_filter": {
             "filter_mode": ConfigField(
@@ -1504,7 +1426,7 @@ class ImpressionAffectionPlugin(BasePlugin):
             ),
             "weight_evaluation_prompt": ConfigField(
                 type=str,
-                default="你是一个消息权重评估助手。请根据消息内容的价值和信息量，为每条消息评估权重分数。\n\n权重分级标准：\n- 高权重 (70-100): 包含重要个人信息、情感表达、独特观点、深度话题等\n- 中权重 (40-69): 有一定信息量，但不是特别重要\n- 低权重 (0-39): 简单的问候、客套话、无实质内容的互动\n\n回复要求：\n1. 只返回JSON格式\n2. 不要包含任何解释或其他内容\n\nJSON格式：\n{{\n    \"weight_score\": 权重分数(0-100的浮点数),\n    \"weight_level\": \"权重等级(high/medium/low)\",\n    \"reason\": \"评估原因\"\n}}\n\n用户消息: {message}\n上下文: {context}",
+                default="你是一个消息权重评估助手。请根据消息内容的价值和信息量，为每条消息评估权重分数。权重分级标准：高权重(70-100)包含重要个人信息、情感表达、独特观点、深度话题等；中权重(40-69)有一定信息量但不重要；低权重(0-39)是简单问候客套话。回复要求：1.只返回JSON格式 2.不要解释。JSON格式：{weight_score:分数, weight_level:等级, reason:原因}。用户消息:{message}, 上下文:{context}",
                 description="权重评估提示词模板（支持 {message}、{context} 占位符）"
             ),
         },
@@ -1516,12 +1438,12 @@ class ImpressionAffectionPlugin(BasePlugin):
         "prompts": {
             "impression_template": ConfigField(
                 type=str,
-                default="你是一个印象分析助手。请根据用户的消息生成简洁的印象描述。\n\n要求：\n- 印象描述要简洁明了，20-40字\n- 保持与历史印象的一致性\n- 关注用户的性格特点、行为习惯、情感倾向\n\n请以JSON格式返回：\n{{\n    \"impression\": \"印象描述\",\n    \"reason\": \"形成这个印象的原因\"\n}}\n\n{history_context}\n\n用户消息: {message}\n上下文: {context}",
+                default="你是一个印象分析助手。请根据用户消息生成简洁的印象描述。 要求：1.印象描述简洁明了20-40字 2.保持历史印象一致性 3.关注性格特点、行为习惯、情感倾向。JSON格式：{impression:描述, reason:原因}。历史:{history_context}, 消息:{message}, 上下文:{context}",
                 description="印象分析提示词模板（支持 {history_context}、{message}、{context} 占位符）"
             ),
             "affection_template": ConfigField(
                 type=str,
-                default="你是一个情感分析师。请评估用户消息的情感倾向，并给出好感度影响建议。\n\n回复要求：\n1. 只返回JSON格式，不要包含其他内容\n2. 评估标准：\n   - friendly: 友善的评论（赞美、鼓励、感谢等）\n   - neutral: 中性的评论（客观陈述、信息性消息等）\n   - negative: 差劲的评论（批评、讽刺、攻击等）\n\nJSON格式：\n{{\n    \"type\": \"评论类型（friendly/neutral/negative）\",\n    \"reason\": \"评估原因\"\n}}\n\n用户消息: {message}\n上下文: {context}",
+                default="你是一个情感分析师。请评估用户消息情感倾向并给好感度影响建议。评估标准：friendly(友善评论)、neutral(中性陈述)、negative(批评攻击)。回复要求：1.只返回JSON 2.包含type和reason。JSON格式：{type:类型, reason:原因}。用户消息:{message}, 上下文:{context}",
                 description="好感度评估提示词模板（支持 {message}、{context} 占位符）"
             ),
         },
