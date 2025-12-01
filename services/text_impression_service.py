@@ -142,19 +142,22 @@ class TextImpressionService:
         """构建印象分析提示词"""
         template = self.prompts_config.get("impression_template", "").strip()
 
+        # 从配置获取长度限制
+        max_history_chars = self.config.get("max_history_chars", 2000)
+        max_message_chars = self.config.get("max_message_chars", 500)
+
         if template:
             return template.format(
-                history_context=history_context[:500],  # 限制历史上下文长度
-                message=message[:200],  # 限制消息长度
+                history_context=history_context[:max_history_chars],
+                message=message[:max_message_chars],
                 context=""
             )
 
-        # 默认提示词 - 优化token使用
-        # 限制历史上下文和消息长度以节省token
-        limited_history = history_context[:300] if len(history_context) > 300 else history_context
-        limited_message = message[:200] if len(message) > 200 else message
+        # 默认提示词 - 使用配置的长度限制
+        limited_history = history_context[:max_history_chars] if len(history_context) > max_history_chars else history_context
+        limited_message = message[:max_message_chars] if len(message) > max_message_chars else message
         
-        return f"分析用户消息按8个维度生成印象，每项10字内，信息不足用待观察。只返回键值对格式：personality_traits:性格特征;interests_hobbies:兴趣爱好;communication_style:交流风格;emotional_tendencies:情感倾向;behavioral_patterns:行为模式;values_attitudes:价值观态度;relationship_preferences:关系偏好;growth_development:成长发展。历史: {limited_history};消息: {limited_message}"
+        return f"请基于用户的聊天记录生成印象描述，用自然语言描述这个人的性格特点、兴趣爱好、交流方式等，长度50-100字。要求语言自然流畅，像朋友介绍这个人一样。如果信息不足，可以适当推测并用'似乎'、'看起来'等词。历史对话: {limited_history} 当前消息: {limited_message}"
 
     def _parse_impression_response(self, content: str) -> Dict[str, str]:
         """解析LLM响应 - 处理自然语言印象"""

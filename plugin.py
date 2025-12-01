@@ -173,20 +173,24 @@ class ImpressionUpdateHandler(BaseEventHandler):
 
             logger.info(f"开始处理用户 {user_id} 的消息: {message_content[:50]}...")
 
-            # 评估消息权重
+            # 获取权重评估所需的历史上下文
+            history_context = self.weight_service.get_historical_context_for_weight(user_id)
+            logger.debug(f"获取到权重评估历史上下文，长度: {len(history_context)}")
+
+            # 评估消息权重（传递历史上下文）
             logger.debug(f"开始评估消息权重 - 用户: {user_id}, 消息: {message_content[:50]}...")
             weight_success, weight_score, weight_level = await self.weight_service.evaluate_message(
-                user_id, message_id, message_content, ""
+                user_id, message_id, message_content, history_context
             )
+
+            # 获取筛选后的历史消息（用于印象构建）
+            history_context, processed_ids = self.weight_service.get_filtered_messages(user_id)
+            logger.debug(f"获取到印象构建历史上下文，长度: {len(history_context)}")
 
             if not weight_success:
                 logger.warning(f"权重评估失败: {weight_level}")
             else:
                 logger.info(f"权重评估成功 - 分数: {weight_score}, 等级: {weight_level}")
-
-            # 获取筛选后的历史消息
-            history_context, processed_ids = self.weight_service.get_filtered_messages(user_id)
-            logger.debug(f"获取到历史上下文，长度: {len(history_context)}")
 
             # 根据权重等级决定是否更新印象
             impression_updated = False
@@ -297,7 +301,7 @@ class ImpressionAffectionPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="2.1.0",
+                default="2.1.1",
                 description="配置文件版本"
             )
         },
@@ -418,6 +422,16 @@ class ImpressionAffectionPlugin(BasePlugin):
                 type=str,
                 default="基于消息内容和上下文对话，评估消息权重（0-100）。权重评估标准：高权重(70-100): 包含重要个人信息、兴趣爱好、价值观、情感表达、深度思考、独特观点、生活经历分享；中权重(40-69): 一般日常对话、简单提问、客观陈述、基础信息交流；低权重(0-39): 简单问候、客套话、无实质内容的互动、表情符号。特别注意：结合上下文判断，分享个人喜好、询问对方偏好、表达个人观点都应该给予较高权重。只返回键值对格式：WEIGHT_SCORE: 分数;WEIGHT_LEVEL: high/medium/low;REASON: 评估原因;当前消息: {message};历史上下文: {context}",
                 description="权重评估提示词模板"
+            ),
+            "max_history_chars": ConfigField(
+                type=int,
+                default=2000,
+                description="历史上下文最大字符数"
+            ),
+            "max_message_chars": ConfigField(
+                type=int,
+                default=500,
+                description="消息最大字符数"
             )
         },
 
@@ -448,7 +462,7 @@ class ImpressionAffectionPlugin(BasePlugin):
         "prompts": {
             "impression_template": ConfigField(
                 type=str,
-                default="基于用户的聊天记录，生成一段自然、整体的印象描述，像朋友介绍这个人一样。要求：1.用'用户xxx是一个...'的句式开头；2.描述性格特点、兴趣爱好、交流方式等；3.语言自然流畅，避免机械的标签化描述；4.长度控制在50-100字；5.如果信息不足，可以适当推测并用'似乎'、'看起来'等词。历史对话: {history_context} 当前消息: {message} 请生成印象描述:",
+                default="请基于用户的聊天记录生成印象描述，用自然语言描述这个人的性格特点、兴趣爱好、交流方式等，长度50-100字。要求语言自然流畅，像朋友介绍这个人一样。如果信息不足，可以适当推测并用'似乎'、'看起来'等词。历史对话: {history_context} 当前消息: {message}",
                 description="印象分析提示词模板"
             ),
             "affection_template": ConfigField(

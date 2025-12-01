@@ -416,7 +416,7 @@ class WeightService:
 
     def get_recent_interactions(self, user_id: str, hours_back: int = 24) -> list:
         """
-        获取用户最近的互动
+        获取用户最近的互动记录
         
         Args:
             user_id: 用户ID
@@ -433,3 +433,59 @@ class WeightService:
         except Exception as e:
             print(f"获取最近互动失败: {str(e)}")
             return []
+
+    def get_historical_context_for_weight(self, user_id: str) -> str:
+        """
+        获取用户历史上下文（专门用于权重评估）
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            历史上下文字符串
+        """
+        try:
+            # 从配置获取参数
+            history_config = self.config.get("history", {})
+            max_messages = history_config.get("max_messages", 20)
+            hours_back = history_config.get("hours_back", 72)
+            min_length = history_config.get("min_message_length", 5)
+            
+            # 转换小时数为天数
+            days_back = max(1, hours_back // 24)
+            
+            # 获取历史消息
+            history_messages = self.db_service.get_user_chat_history(
+                user_id=user_id,
+                limit=max_messages,
+                days_back=days_back
+            )
+            
+            # 过滤掉太短的消息
+            filtered_messages = [
+                msg for msg in history_messages 
+                if msg["content"] and len(msg["content"].strip()) >= min_length
+            ]
+            
+            if not filtered_messages:
+                return ""
+            
+            # 构建上下文
+            contexts = []
+            contexts.append("历史对话:")
+            
+            # 使用配置中的最大消息数
+            for msg in filtered_messages:
+                timestamp = msg["datetime"]
+                content = msg["content"]  # 不限制长度，让配置控制
+                if isinstance(timestamp, datetime):
+                    time_str = timestamp.strftime('%m-%d %H:%M')
+                else:
+                    time_str = str(timestamp)
+                contexts.append(f"[{time_str}] {content}")
+            
+            return "\n".join(contexts)
+            
+        except Exception as e:
+            logger.error(f"获取权重评估历史上下文失败: {str(e)}")
+            return ""
