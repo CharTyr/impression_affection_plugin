@@ -197,7 +197,7 @@ class ImpressionUpdateHandler(BaseEventHandler):
             if self.weight_service.db_service and self.weight_service.db_service.is_connected():
                 message_id = self.weight_service.db_service.get_main_message_id(user_id, message_timestamp)
                 if message_id:
-                    logger.info(f"获取到主程序实际消息ID: {message_id}")
+                    logger.debug(f"获取到主程序实际消息ID: {message_id}")
                 else:
                     logger.debug(f"无法从主程序数据库获取message_id，用户: {user_id}, 时间戳: {message_timestamp}")
             
@@ -224,7 +224,7 @@ class ImpressionUpdateHandler(BaseEventHandler):
 
             # 获取过滤后的历史上下文（用于权重评估）
             history_context, processed_ids = self.weight_service.get_filtered_messages(user_id)
-            logger.debug(f"获取到过滤后的历史上下文，长度: {len(history_context)} 字符，包含消息 {len(processed_ids)} 条")
+            logger.info(f"获取到过滤后的历史上下文，长度: {len(history_context)} 字符，包含消息 {len(processed_ids)} 条")
 
             # 检查过滤后的上下文是否为空，如果为空则跳过权重评估
             weight_success = False
@@ -243,7 +243,7 @@ class ImpressionUpdateHandler(BaseEventHandler):
                 if not weight_success:
                     logger.warning(f"权重评估失败: {weight_level}")
                 else:
-                    logger.debug(f"权重评估成功 - 分数: {weight_score}, 等级: {weight_level}")
+                    logger.info(f"权重评估成功 - 分数: {weight_score}, 等级: {weight_level}")
 
             # 根据权重等级决定是否更新印象
             impression_updated = False
@@ -283,7 +283,7 @@ class ImpressionUpdateHandler(BaseEventHandler):
                     )
                     if success:
                         impression_updated = True
-                        logger.debug(f"印象更新成功")
+                        logger.info(f"印象更新成功")
                     else:
                         logger.warning(f"印象更新失败")
                 except Exception as e:
