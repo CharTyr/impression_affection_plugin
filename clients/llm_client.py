@@ -58,20 +58,49 @@ class CustomProvider(BaseLLMProvider):
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.api_key = config.get("api_key")
-        self.api_endpoint = config.get("api_endpoint")
+        # 统一使用 base_url 字段，兼容用户配置习惯
+        self.base_url = config.get("base_url", "").rstrip("/")
         self.model_id = config.get("model_id")
+
+    def _get_endpoint(self) -> str:
+        """
+        获取完整的API端点URL
+        支持两种配置方式：
+        1. 完整端点: https://api.example.com/v1/chat/completions
+        2. 版本号结尾: https://api.example.com/v1 (自动补全 /chat/completions)
+        """
+        if not self.base_url:
+            raise ValueError("自定义API未配置: 缺少base_url")
+
+        endpoint = self.base_url.rstrip("/")
+
+        # 如果已经是完整端点，直接返回
+        if "/chat/completions" in endpoint:
+            return endpoint
+
+        # 检测版本号结尾 (/v1, /v3 等)，自动补全
+        if "/v1" == endpoint[-3:] or "/v3" == endpoint[-3:] or "/api/v1" in endpoint or "/api/v3" in endpoint:
+            return f"{endpoint}/chat/completions"
+
+        raise ValueError(
+            f"自定义API端点格式不正确: {endpoint}\n"
+            f"请配置完整端点或版本号结尾，如: https://api.siliconflow.cn/v1"
+        )
 
     async def generate(self, prompt: str, **kwargs) -> Tuple[bool, str]:
         """使用自定义API生成文本"""
         try:
             import httpx
 
+            # 获取完整端点URL
+            endpoint = self._get_endpoint()
+
             temperature = kwargs.get("temperature", 0.3)
             max_tokens = kwargs.get("max_tokens", 200)
 
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.post(
-                    self.api_endpoint,
+                    endpoint,
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json"
