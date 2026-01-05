@@ -1,4 +1,4 @@
-# 印象和好感度系统插件 v2.3.5
+# 印象和好感度系统插件 v2.3.6
 
 基于LLM分析用户行为和消息，构建用户画像并维护好感度关系
 
@@ -25,6 +25,11 @@
 - 等级自动划分：非常差、很差、较差、一般、较好、很好、非常好
 - 基于消息内容的智能情感判断
 
+### 动作检定（可选）
+- 由 planner 判断是否需要触发检定，并给出成功率与结果（非程序随机）
+- replyer 只接收检定结果并自由发挥“接受/拒绝”回复
+- 可选在回复开头展示标签：`[动作检定： 80% 失败]`
+
 ### 智能筛选机制
 - 基于主程序数据库message_id的精确查重
 - 消息权重评估：高权重(70-100)、中权重(40-69)、低权重(0-39)
@@ -43,8 +48,9 @@
 
 ### 组件系统
 - 工具组件：GetUserImpressionTool、SearchImpressionsTool
-- 命令组件：ViewImpressionCommand、SetAffectionCommand、ListImpressionsCommand
-- 事件处理：ImpressionUpdateHandler
+- 动作组件：ActionCheckAction
+- 命令组件：ViewImpressionCommand、SetAffectionCommand、ListImpressionsCommand、ToggleActionCheckCommand、ToggleActionCheckShowResultCommand
+- 事件处理：ImpressionUpdateHandler、ActionCheckPlannerPromptHandler、ActionCheckPostLLMHandler、ActionCheckAfterLLMHandler、ActionCheckPostSendPrefixHandler
 
 ### 数据模型
 - UserImpression：用户印象和好感度数据
@@ -66,10 +72,28 @@
 ### LLM提供商配置
 ```toml
 [llm_provider]
-provider_type = "openai"  # 或 "custom"
-api_key = "your-api-key"
-base_url = "https://api.openai.com/v1"
-model_id = "gpt-3.5-turbo"
+# 默认使用主程序模型任务组（推荐）
+provider_type = "main"      # main/openai/custom
+task_group = "utils"        # 主程序 model_task_config.<task_group>
+
+# 如果你希望插件使用独立API，再切换为 openai/custom 并填写以下配置：
+# provider_type = "openai"
+# api_key = "your-api-key"
+# base_url = "https://api.openai.com/v1"
+# model_id = "gpt-3.5-turbo"
+```
+
+### 管理员权限配置（命令仅管理员可用）
+```toml
+[permissions]
+admin = ["qq:768295235"]
+```
+
+### 动作检定配置（由planner决定检定结果）
+```toml
+[action_check]
+enabled = false
+show_roll_result = false
 ```
 
 ### 权重筛选配置
@@ -101,7 +125,7 @@ pip install -r requirements.txt
 ```
 
 ### 配置文件
-插件首次启动时会自动生成 `config.toml` 配置文件，请根据需要修改LLM API配置。
+插件首次启动时会自动生成 `config.toml` 配置文件；默认直接使用主程序 `utils` 任务组，无需额外填写 API 配置（除非你切换到 openai/custom）。
 
 ## 使用指南
 
@@ -110,10 +134,12 @@ pip install -r requirements.txt
 - 智能分析用户消息并更新印象和好感度
 - 支持权重筛选，仅处理有价值的信息
 
-### 手动命令（暂时没用）
+### 管理命令（仅管理员；非管理员静默无回复）
 - `/impression view <user_id>` - 查看用户印象信息
 - `/impression set <user_id> <score>` - 设置好感度分数
 - `/impression list` - 列出所有用户印象
+- `/impression roll on|off|status` - 动作检定总开关（实时生效，仅内存，重启恢复默认）
+- `/impression rollshow on|off|status` - 检定结果标签开关（实时生效，仅内存，重启恢复默认）
 
 ### LLM工具
 - `get_user_impression` - 获取用户印象数据

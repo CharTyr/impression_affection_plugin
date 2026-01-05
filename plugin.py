@@ -2,6 +2,10 @@
 印象和好感度系统插件
 """
 
+from dataclasses import dataclass
+import json
+import re
+import time
 from typing import List, Tuple, Type, Dict, Any, Optional
 import os
 import asyncio
@@ -34,15 +38,325 @@ from .services import (
 
 # 导入组件
 from .components import (
+    ActionCheckAction,
     GetUserImpressionTool,
     SearchImpressionsTool,
     ViewImpressionCommand,
     SetAffectionCommand,
-    ListImpressionsCommand
+    ListImpressionsCommand,
+    ToggleActionCheckCommand,
+    ToggleActionCheckShowResultCommand,
 )
 
 
 logger = get_logger("impression_affection_system")
+
+
+# =============================================================================
+# 动作检定（planner -> replyer）上下文传递
+#
+# 重要约束：
+# - 不改主程序：replyer 不会读取 action_data，因此需要通过 planner 的“推理文本”写入标记行。
+# - 回复展示标签不能放在 llm_response_content 中（会被主程序后处理移除），因此在发送阶段加前缀。
+# =============================================================================
+
+_ACTION_CHECK_MARKER_PREFIX = "ACTION_CHECK_JSON:"
+_ACTION_CHECK_SENTINEL = "[impression_affection_plugin:action_check]"
+_ACTION_CHECK_CONTEXT_TTL_SECONDS = 120.0
+_ACTION_CHECK_PENDING_TAG_TTL_SECONDS = 60.0
+
+
+@dataclass
+class ActionCheckContext:
+    stream_id: str
+    interaction: str
+    chance: int
+    result: str  # "success" | "fail"
+    created_at: float
+
+
+_ACTION_CHECK_CONTEXT_BY_STREAM: Dict[str, ActionCheckContext] = {}
+_ACTION_CHECK_PENDING_TAG_BY_STREAM: Dict[str, Tuple[str, float]] = {}
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _clean_expired_action_check_state(stream_id: str) -> None:
+    ctx = _ACTION_CHECK_CONTEXT_BY_STREAM.get(stream_id)
+    if ctx and (_now_ts() - ctx.created_at) > _ACTION_CHECK_CONTEXT_TTL_SECONDS:
+        _ACTION_CHECK_CONTEXT_BY_STREAM.pop(stream_id, None)
+    tag_entry = _ACTION_CHECK_PENDING_TAG_BY_STREAM.get(stream_id)
+    if tag_entry and (_now_ts() - tag_entry[1]) > _ACTION_CHECK_PENDING_TAG_TTL_SECONDS:
+        _ACTION_CHECK_PENDING_TAG_BY_STREAM.pop(stream_id, None)
+
+
+def _parse_action_check_marker(text: str) -> Optional[ActionCheckContext]:
+    if not text:
+        return None
+
+    matches = re.findall(rf"{re.escape(_ACTION_CHECK_MARKER_PREFIX)}\s*(\{{[^\r\n]*\}})", text)
+    if not matches:
+        return None
+
+    raw_json = matches[-1].strip()
+    try:
+        payload = json.loads(raw_json)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    interaction = str(payload.get("interaction", "")).strip()
+    result = str(payload.get("result", "")).strip().lower()
+    chance_raw = payload.get("chance")
+
+    try:
+        chance = int(chance_raw)
+    except Exception:
+        return None
+
+    if result in {"ok", "pass", "passed", "success"}:
+        result = "success"
+    elif result in {"fail", "failed", "failure"}:
+        result = "fail"
+    else:
+        return None
+
+    chance = max(0, min(100, chance))
+    if not interaction:
+        return None
+
+    return ActionCheckContext(
+        stream_id="",
+        interaction=interaction,
+        chance=chance,
+        result=result,
+        created_at=_now_ts(),
+    )
+
+
+def _strip_action_check_marker_lines(text: str) -> str:
+    if not text:
+        return text
+    return re.sub(rf"(?m)^\s*{re.escape(_ACTION_CHECK_MARKER_PREFIX)}.*(?:\r?\n)?", "", text)
+
+
+def _format_action_check_tag(chance: int, result: str) -> str:
+    zh_result = "成功" if result == "success" else "失败"
+    return f"[动作检定： {chance}% {zh_result}]"
+
+
+class ActionCheckPlannerPromptHandler(BaseEventHandler):
+    """为 planner 注入动作检定输出协议（不改主程序）"""
+
+    event_type = EventType.ON_PLAN
+    handler_name = "action_check_planner_prompt"
+    handler_description = "为 planner 注入动作检定（action_check）输出规则"
+    intercept_message = True
+    weight = 100
+
+    async def execute(self, message) -> tuple:
+        try:
+            enabled = bool(self.get_config("action_check.enabled", False))
+            if not enabled or not message or not message.llm_prompt:
+                return True, True, None, None, None
+
+            if _ACTION_CHECK_SENTINEL in message.llm_prompt:
+                return True, True, None, None, None
+
+            show_roll_result = bool(self.get_config("action_check.show_roll_result", False))
+
+            platform = str(message.message_base_info.get("platform", "") or "")
+            raw_user_id = str(message.message_base_info.get("user_id", "") or "")
+            from .services.message_service import MessageService
+
+            user_id = MessageService.normalize_user_id(raw_user_id)
+
+            affection_score = 50.0
+            affection_level = "一般"
+            try:
+                imp = UserImpression.select().where(UserImpression.user_id == user_id).first()
+                if imp and imp.affection_score is not None:
+                    affection_score = float(imp.affection_score)
+                    affection_level = str(imp.affection_level or affection_level)
+            except Exception:
+                pass
+
+            extra_block = f"""
+
+{_ACTION_CHECK_SENTINEL}
+【动作检定（action_check）插件协议】
+当你判断“用户正在尝试与麦麦进行直接动作互动”（例如：抱抱、亲亲、摸头、rua 等）时：
+1) 请在同一轮规划中同时选择 reply 与 action_check（不要只选 action_check）。
+2) action_check 的 JSON 需要包含字段：
+   - interaction: 动作名（字符串）
+   - chance: 成功率（0-100 整数，已综合基础概率/好感度/上下文）
+   - result: success 或 fail（由你根据 chance 与上下文直接决定，不要让程序随机）
+3) 必须在 JSON 代码块之前的推理文本末尾追加一行（仅当选择 action_check 时输出）：
+   ACTION_CHECK_JSON: {{"interaction":"抱抱","chance":80,"result":"fail"}}
+   - 这行必须是单行严格 JSON
+   - 不要输出除这一行之外的其他 ACTION_CHECK_JSON 标记
+
+当前用户信息（供你参考）：
+- platform: {platform}
+- user_id: {raw_user_id}
+- affection_score: {affection_score:.1f}/100
+- affection_level: {affection_level}
+
+备注：{'机器人会在最终回复开头自动加上检定标签，你无需在回复正文里复述该标签。' if show_roll_result else '当前配置关闭了检定标签展示。'}
+""".strip(
+                "\n"
+            )
+
+            message.modify_llm_prompt(f"{message.llm_prompt.rstrip()}\n\n{extra_block}")
+            return True, True, "动作检定 planner 协议已注入", None, message
+        except Exception as e:
+            logger.error(f"动作检定 planner 注入失败: {e}", exc_info=True)
+            return True, True, None, None, None
+
+
+class ActionCheckPostLLMHandler(BaseEventHandler):
+    """为 replyer 注入检定结果块，并缓存上下文供发送阶段加标签"""
+
+    event_type = EventType.POST_LLM
+    handler_name = "action_check_post_llm"
+    handler_description = "在 replyer 生成前注入动作检定结果"
+    intercept_message = True
+    weight = 100
+
+    async def execute(self, message) -> tuple:
+        try:
+            enabled = bool(self.get_config("action_check.enabled", False))
+            if not enabled or not message or not message.llm_prompt or not message.stream_id:
+                return True, True, None, None, None
+
+            stream_id = str(message.stream_id)
+            _clean_expired_action_check_state(stream_id)
+
+            parsed = _parse_action_check_marker(message.llm_prompt)
+            if not parsed:
+                _ACTION_CHECK_CONTEXT_BY_STREAM.pop(stream_id, None)
+                return True, True, None, None, None
+
+            parsed.stream_id = stream_id
+            _ACTION_CHECK_CONTEXT_BY_STREAM[stream_id] = parsed
+
+            cleaned_prompt = _strip_action_check_marker_lines(message.llm_prompt)
+            if cleaned_prompt is None:
+                cleaned_prompt = message.llm_prompt
+
+            zh_result = "成功" if parsed.result == "success" else "失败"
+            injected = f"""
+
+{_ACTION_CHECK_SENTINEL}
+【动作检定结果】
+动作：{parsed.interaction}
+成功率：{parsed.chance}%
+结果：{zh_result}
+
+以上信息仅供你生成回复时参考。
+注意：不要在回复中输出 ACTION_CHECK_JSON 或其他内部标记。
+""".strip(
+                "\n"
+            )
+
+            message.modify_llm_prompt(f"{cleaned_prompt.rstrip()}\n\n{injected}")
+            return True, True, "动作检定结果已注入 replyer prompt", None, message
+        except Exception as e:
+            logger.error(f"动作检定 POST_LLM 注入失败: {e}", exc_info=True)
+            return True, True, None, None, None
+
+
+class ActionCheckAfterLLMHandler(BaseEventHandler):
+    """在 LLM 生成后标记待发送标签（发送阶段加前缀，避免主程序后处理移除）"""
+
+    event_type = EventType.AFTER_LLM
+    handler_name = "action_check_after_llm"
+    handler_description = "动作检定：为发送阶段准备前缀标签"
+    intercept_message = True
+    weight = 100
+
+    async def execute(self, message) -> tuple:
+        try:
+            enabled = bool(self.get_config("action_check.enabled", False))
+            show_roll_result = bool(self.get_config("action_check.show_roll_result", False))
+            if not enabled or not show_roll_result or not message or not message.stream_id:
+                return True, True, None, None, None
+
+            stream_id = str(message.stream_id)
+            _clean_expired_action_check_state(stream_id)
+
+            ctx = _ACTION_CHECK_CONTEXT_BY_STREAM.get(stream_id)
+            if not ctx:
+                return True, True, None, None, None
+
+            tag = _format_action_check_tag(ctx.chance, ctx.result)
+            _ACTION_CHECK_PENDING_TAG_BY_STREAM[stream_id] = (tag, _now_ts())
+            return True, True, "动作检定标签已准备", None, None
+        except Exception as e:
+            logger.error(f"动作检定 AFTER_LLM 处理失败: {e}", exc_info=True)
+            return True, True, None, None, None
+
+
+class ActionCheckPostSendPrefixHandler(BaseEventHandler):
+    """在发送前把检定标签前缀加到首条文本消息上（保证不被后处理剥离）"""
+
+    event_type = EventType.POST_SEND_PRE_PROCESS
+    handler_name = "action_check_post_send_prefix"
+    handler_description = "动作检定：发送前为首条文本消息加前缀标签"
+    intercept_message = True
+    weight = 100
+
+    async def execute(self, message) -> tuple:
+        try:
+            enabled = bool(self.get_config("action_check.enabled", False))
+            show_roll_result = bool(self.get_config("action_check.show_roll_result", False))
+            if not enabled or not show_roll_result or not message or not message.stream_id:
+                return True, True, None, None, None
+
+            stream_id = str(message.stream_id)
+            _clean_expired_action_check_state(stream_id)
+
+            pending = _ACTION_CHECK_PENDING_TAG_BY_STREAM.get(stream_id)
+            if not pending:
+                return True, True, None, None, None
+
+            tag, _ = pending
+            if not message.message_segments:
+                return True, True, None, None, None
+
+            modified_segments = None
+            for seg in message.message_segments:
+                if getattr(seg, "type", None) != "text":
+                    continue
+                if not isinstance(getattr(seg, "data", None), str):
+                    continue
+                text = str(seg.data)
+                if text.lstrip().startswith("[动作检定："):
+                    _ACTION_CHECK_PENDING_TAG_BY_STREAM.pop(stream_id, None)
+                    _ACTION_CHECK_CONTEXT_BY_STREAM.pop(stream_id, None)
+                    return True, True, None, None, None
+
+                prefixed = f"{tag} {text}".rstrip()
+                seg.data = prefixed  # type: ignore[attr-defined]
+                modified_segments = message.message_segments
+                break
+
+            if not modified_segments:
+                return True, True, None, None, None
+
+            message.modify_message_segments(modified_segments, suppress_warning=True)
+
+            _ACTION_CHECK_PENDING_TAG_BY_STREAM.pop(stream_id, None)
+            _ACTION_CHECK_CONTEXT_BY_STREAM.pop(stream_id, None)
+
+            return True, True, "动作检定标签已加到发送消息", None, message
+        except Exception as e:
+            logger.error(f"动作检定 POST_SEND_PRE_PROCESS 处理失败: {e}", exc_info=True)
+            return True, True, None, None, None
 
 
 class ImpressionUpdateHandler(BaseEventHandler):
@@ -409,7 +723,7 @@ class ImpressionAffectionPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="2.2.7",
+                default="2.3.6",
                 description="配置文件版本"
             )
         },
@@ -420,8 +734,13 @@ class ImpressionAffectionPlugin(BasePlugin):
         "llm_provider": {
             "provider_type": ConfigField(
                 type=str,
-                default="openai",
-                description="印象构建/好感度更新LLM提供商 (openai)"
+                default="main",
+                description="LLM提供商: main(主程序任务组)/openai/custom"
+            ),
+            "task_group": ConfigField(
+                type=str,
+                default="utils",
+                description="当 provider_type=main 时使用的主程序模型任务组（默认 utils）"
             ),
             "api_key": ConfigField(
                 type=str,
@@ -437,6 +756,33 @@ class ImpressionAffectionPlugin(BasePlugin):
                 type=str,
                 default="gpt-3.5-turbo",
                 description="模型名称"
+            )
+        },
+
+        # =============================================================================
+        # 权限配置
+        # =============================================================================
+        "permissions": {
+            "admin": ConfigField(
+                type=list,
+                default=[],
+                description="允许使用插件命令的管理员列表（platform:user_id 或 user_id）"
+            )
+        },
+
+        # =============================================================================
+        # 动作检定配置（由 planner 决定结果）
+        # =============================================================================
+        "action_check": {
+            "enabled": ConfigField(
+                type=bool,
+                default=False,
+                description="启用动作检定功能（planner 同选 reply+action_check，并给出检定结果）"
+            ),
+            "show_roll_result": ConfigField(
+                type=bool,
+                default=False,
+                description="在最终回复开头展示检定结果标签（通过发送阶段加前缀，实时生效）"
             )
         },
 
@@ -690,6 +1036,13 @@ class ImpressionAffectionPlugin(BasePlugin):
 
         # 添加事件处理器
         components.append((ImpressionUpdateHandler.get_handler_info(), ImpressionUpdateHandler))
+        components.append((ActionCheckPlannerPromptHandler.get_handler_info(), ActionCheckPlannerPromptHandler))
+        components.append((ActionCheckPostLLMHandler.get_handler_info(), ActionCheckPostLLMHandler))
+        components.append((ActionCheckAfterLLMHandler.get_handler_info(), ActionCheckAfterLLMHandler))
+        components.append((ActionCheckPostSendPrefixHandler.get_handler_info(), ActionCheckPostSendPrefixHandler))
+
+        # 动作组件（用于让 planner 显式选择 action_check）
+        components.append((ActionCheckAction.get_action_info(), ActionCheckAction))
 
         # 根据配置添加组件
         features_config = self.get_config("features", {})
@@ -706,7 +1059,9 @@ class ImpressionAffectionPlugin(BasePlugin):
             components.extend([
                 (ViewImpressionCommand.get_command_info(), ViewImpressionCommand),
                 (SetAffectionCommand.get_command_info(), SetAffectionCommand),
-                (ListImpressionsCommand.get_command_info(), ListImpressionsCommand)
+                (ListImpressionsCommand.get_command_info(), ListImpressionsCommand),
+                (ToggleActionCheckCommand.get_command_info(), ToggleActionCheckCommand),
+                (ToggleActionCheckShowResultCommand.get_command_info(), ToggleActionCheckShowResultCommand),
             ])
 
         return components

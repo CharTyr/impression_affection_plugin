@@ -3,7 +3,7 @@ LLM客户端 - 统一的LLM API调用接口
 """
 
 import json
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 from abc import ABC, abstractmethod
 
 
@@ -130,6 +130,38 @@ class CustomProvider(BaseLLMProvider):
             return False, f"自定义API调用失败: {str(e)}"
 
 
+class MaiBotProvider(BaseLLMProvider):
+    """主程序模型任务组提供商（默认使用 utils 任务组）"""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.task_group = config.get("task_group", "utils")
+
+    async def generate(self, prompt: str, **kwargs) -> Tuple[bool, str]:
+        try:
+            from src.plugin_system.apis import llm_api
+
+            models = llm_api.get_available_models()
+            task_config = models.get(self.task_group)
+            if not task_config:
+                return False, f"未找到主程序模型任务组: {self.task_group}"
+
+            request_type = kwargs.get("request_type", "impression_affection_plugin.generate")
+            temperature = kwargs.get("temperature")
+            max_tokens = kwargs.get("max_tokens")
+
+            success, content, _, _ = await llm_api.generate_with_model(
+                prompt=prompt,
+                model_config=task_config,
+                request_type=request_type,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return success, content
+        except Exception as e:
+            return False, f"主程序LLM调用失败: {str(e)}"
+
+
 class LLMClient:
     """LLM客户端 - 统一的LLM调用接口"""
 
@@ -140,17 +172,19 @@ class LLMClient:
 
     def _create_provider(self) -> BaseLLMProvider:
         """创建提供商实例"""
+        if self.provider_type in {"main", "maibot"}:
+            return MaiBotProvider(self.config)
         if self.provider_type == "openai":
             return OpenAIProvider(self.config)
-        elif self.provider_type == "custom":
+        if self.provider_type == "custom":
             return CustomProvider(self.config)
-        else:
-            raise ValueError(f"不支持的提供商类型: {self.provider_type}")
+        raise ValueError(f"不支持的提供商类型: {self.provider_type}")
 
     async def generate(self, prompt: str, **kwargs) -> Tuple[bool, str]:
         """生成文本"""
-        if not self.config.get("api_key") or not self.config.get("model_id"):
-            return False, "LLM未配置: 缺少api_key或model_id"
+        if self.provider_type not in {"main", "maibot"}:
+            if not self.config.get("api_key") or not self.config.get("model_id"):
+                return False, "LLM未配置: 缺少api_key或model_id"
 
         return await self.provider.generate(prompt, **kwargs)
 
@@ -159,14 +193,29 @@ class LLMClient:
         # 进一步增大max_tokens，确保有足够的空间返回完整的JSON
         # 印象分析需要更多token，因为需要生成印象描述和原因
         # 增大到2000，避免响应被截断
-        return await self.generate(prompt, temperature=0.3, max_tokens=2000)
+        return await self.generate(
+            prompt,
+            temperature=0.3,
+            max_tokens=2000,
+            request_type="impression_affection.impression",
+        )
 
     async def generate_affection_analysis(self, prompt: str) -> Tuple[bool, str]:
         """生成好感度分析 - 专用接口"""
         # 增大max_tokens，确保返回完整的JSON
-        return await self.generate(prompt, temperature=0.3, max_tokens=1500)
+        return await self.generate(
+            prompt,
+            temperature=0.3,
+            max_tokens=1500,
+            request_type="impression_affection.affection",
+        )
 
     async def generate_weight_evaluation(self, prompt: str) -> Tuple[bool, str]:
         """生成权重评估 - 专用接口"""
         # 增大max_tokens
-        return await self.generate(prompt, temperature=0.2, max_tokens=1000)
+        return await self.generate(
+            prompt,
+            temperature=0.2,
+            max_tokens=1000,
+            request_type="impression_affection.weight",
+        )
