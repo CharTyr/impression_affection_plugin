@@ -82,6 +82,29 @@ _ACTION_CHECK_PENDING_TAG_BY_STREAM: Dict[str, Tuple[str, float]] = {}
 def _now_ts() -> float:
     return time.time()
 
+def _get_user_display_name(message) -> str:
+    if not message:
+        return ""
+
+    base = getattr(message, "message_base_info", {}) or {}
+    platform = str(base.get("platform", "") or "").strip()
+    raw_user_id = str(base.get("user_id", "") or "").strip()
+
+    # 优先使用 MaiBot 记住/给对方起的名字（PersonInfo.person_name）
+    if platform and raw_user_id:
+        try:
+            from src.person_info.person_info import Person
+
+            person = Person(platform=platform, user_id=raw_user_id)
+            person_name = str(getattr(person, "person_name", "") or "").strip()
+            if person_name:
+                return person_name
+        except Exception:
+            pass
+
+    nick = str(base.get("user_nickname", "") or "").strip()
+    return nick or raw_user_id
+
 
 def _clean_expired_action_check_state(stream_id: str) -> None:
     ctx = _ACTION_CHECK_CONTEXT_BY_STREAM.get(stream_id)
@@ -171,6 +194,7 @@ class ActionCheckPlannerPromptHandler(BaseEventHandler):
 
             platform = str(message.message_base_info.get("platform", "") or "")
             raw_user_id = str(message.message_base_info.get("user_id", "") or "")
+            user_display_name = _get_user_display_name(message).strip() or raw_user_id
             from .services.message_service import MessageService
 
             user_id = MessageService.normalize_user_id(raw_user_id)
@@ -202,7 +226,8 @@ class ActionCheckPlannerPromptHandler(BaseEventHandler):
 
 当前用户信息（供你参考）：
 - platform: {platform}
-- user_id: {raw_user_id}
+- user_name: {user_display_name}
+- user_id: {raw_user_id}（仅用于检索/关联数据库，不要把它当作对话里出现的名字）
 - affection_score: {affection_score:.1f}/100
 - affection_level: {affection_level}
 
@@ -249,10 +274,12 @@ class ActionCheckPostLLMHandler(BaseEventHandler):
                 cleaned_prompt = message.llm_prompt
 
             zh_result = "成功" if parsed.result == "success" else "失败"
+            user_display_name = _get_user_display_name(message).strip()
             injected = f"""
 
 {_ACTION_CHECK_SENTINEL}
 【动作检定结果】
+对象：{user_display_name or '（未知）'}
 动作：{parsed.interaction}
 成功率：{parsed.chance}%
 结果：{zh_result}
